@@ -1,0 +1,365 @@
+package com.alor.test;
+
+import okhttp3.*;
+import org.java_websocket.client.WebSocketClient;
+import org.java_websocket.handshake.ServerHandshake;
+import org.json.JSONObject;
+
+import java.net.URI;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Test module for connecting to Alor OpenAPI production environment
+ * Documentation: https://alor.dev/docs/api/quick-start/prod-env/
+ */
+public class AlorOpenApiProdTester {
+    private static final String REST_URL = "https://api.alor.ru";
+    private static final String WS_URL = "wss://api.alor.ru/ws";
+    private static final String TOKEN_URL = "https://oauth.alor.ru/oauth2/token";
+    
+    // Fixed credentials from Alor registration
+    private static final String FIXED_LOGIN = "+79811455733";
+    private static final String FIXED_PASSWORD = "!Remarque1938!";
+    private static final String FIXED_REFRESH_TOKEN = "d048ce72-0c81-4568-93e6-dcf60444f860";
+    
+    // Client ID and Secret are still required for OAuth2 flow
+    private final String clientId;
+    private final String clientSecret;
+    private String accessToken;
+    private String refreshToken;
+    private final OkHttpClient httpClient;
+    private TestWebSocketClient webSocketClient;
+    private boolean isConnected = false;
+
+    public AlorOpenApiProdTester(String clientId, String clientSecret) {
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+        this.refreshToken = FIXED_REFRESH_TOKEN; // Use the provided refresh token
+        
+        this.httpClient = new OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .build();
+    }
+
+    /**
+     * Get JWT token via OAuth2 using refresh token
+     */
+    public boolean obtainTokens() {
+        System.out.println("Getting JWT token for production environment...");
+        
+        try {
+            // Encode client_id and client_secret for Basic Auth
+            String credentials = clientId + ":" + clientSecret;
+            String basicAuth = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes());
+            
+            RequestBody body = new FormBody.Builder()
+                    .add("grant_type", "refresh_token")
+                    .add("refresh_token", refreshToken)
+                    .build();
+
+            Request request = new Request.Builder()
+                    .url(TOKEN_URL)
+                    .post(body)
+                    .addHeader("Authorization", basicAuth)
+                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
+                    .build();
+
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (response.isSuccessful()) {
+                    String responseBody = response.body().string();
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+                    
+                    accessToken = jsonResponse.getString("access_token");
+                    refreshToken = jsonResponse.getString("refresh_token"); // Update refresh token
+                    
+                    System.out.println("✅ Tokens successfully received!");
+                    System.out.println("Access Token: " + accessToken.substring(0, 20) + "...");
+                    System.out.println("Refresh Token: " + refreshToken.substring(0, 20) + "...");
+                    System.out.println("Expires in: " + jsonResponse.getInt("expires_in") + " seconds");
+                    return true;
+                } else {
+                    System.out.println("❌ Token retrieval error: " + response.code() + " - " + response.message());
+                    if (response.body() != null) {
+                        System.out.println("Details: " + response.body().string());
+                    }
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("❌ Exception during token retrieval: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * Test REST connection
+     */
+    public boolean testRestConnection() {
+        System.out.println("Testing REST connection to Alor OpenAPI production environment...");
+        
+        if (accessToken == null) {
+            System.out.println("❌ No access token, get token first");
+            return false;
+        }
+        
+        try {
+            // Get portfolio information
+            Request request = new Request.Builder()
+                    .url(REST_URL + "/md/v2/clients")
+                    .addHeader("X-ALOR-REQ", "test-request")
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("Authorization", "Bearer " + accessToken)
+                    .build();
+
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (response.isSuccessful()) {
+                    String responseBody = response.body().string();
+                    System.out.println("✅ REST connection successful!");
+                    System.out.println("Server response: " + responseBody);
+                    return true;
+                } else {
+                    System.out.println("❌ REST connection error: " + response.code() + " - " + response.message());
+                    if (response.body() != null) {
+                        System.out.println("Details: " + response.body().string());
+                    }
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("❌ Exception during REST connection: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * Get instrument information
+     */
+    public boolean testSecuritiesInfo(String symbol, String exchange) {
+        System.out.println("Getting information for instrument " + symbol + " on " + exchange + "...");
+        
+        if (accessToken == null) {
+            System.out.println("❌ No access token, get token first");
+            return false;
+        }
+        
+        try {
+            Request request = new Request.Builder()
+                    .url(REST_URL + "/md/v2/securities/" + exchange + "/" + symbol)
+                    .addHeader("X-ALOR-REQ", "securities-info")
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("Authorization", "Bearer " + accessToken)
+                    .build();
+
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (response.isSuccessful()) {
+                    String responseBody = response.body().string();
+                    System.out.println("✅ Instrument information received!");
+                    System.out.println("Server response: " + responseBody);
+                    return true;
+                } else {
+                    System.out.println("❌ Information retrieval error: " + response.code() + " - " + response.message());
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("❌ Exception during information retrieval: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * Test WebSocket connection
+     */
+    public boolean testWebSocketConnection() {
+        System.out.println("Testing WebSocket connection to Alor OpenAPI production environment...");
+        
+        if (accessToken == null) {
+            System.out.println("❌ No access token, get token first");
+            return false;
+        }
+        
+        try {
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Authorization", "Bearer " + accessToken);
+
+            webSocketClient = new TestWebSocketClient(new URI(WS_URL), headers);
+            webSocketClient.connect();
+            
+            // Wait for connection
+            for (int i = 0; i < 10; i++) {
+                if (isConnected) {
+                    System.out.println("✅ WebSocket connection successful!");
+                    
+                    // Subscribe to SBER quotes
+                    subscribeToQuotes("SBER", "MOEX");
+                    return true;
+                }
+                Thread.sleep(500);
+            }
+            
+            System.out.println("❌ WebSocket connection timeout");
+            return false;
+            
+        } catch (Exception e) {
+            System.out.println("❌ Exception during WebSocket connection: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    private void subscribeToQuotes(String symbol, String exchange) {
+        if (!isConnected || webSocketClient == null) return;
+        
+        try {
+            JSONObject subscribeMessage = new JSONObject();
+            subscribeMessage.put("opcode", "QuotesSubscribe");
+            subscribeMessage.put("code", symbol);
+            subscribeMessage.put("exchange", exchange);
+            subscribeMessage.put("format", "Simple");
+            subscribeMessage.put("guid", java.util.UUID.randomUUID().toString());
+            
+            webSocketClient.send(subscribeMessage.toString());
+            System.out.println("Subscription to " + symbol + " quotes sent");
+            
+        } catch (Exception e) {
+            System.out.println("Subscription error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * WebSocket client for testing
+     */
+    private class TestWebSocketClient extends WebSocketClient {
+        public TestWebSocketClient(URI serverUri, Map<String, String> headers) {
+            super(serverUri, headers);
+        }
+
+        @Override
+        public void onOpen(ServerHandshake handshakedata) {
+            System.out.println("WebSocket connection opened");
+            isConnected = true;
+            
+            // Send welcome message with JWT
+            try {
+                JSONObject authMessage = new JSONObject();
+                authMessage.put("token", accessToken);
+                authMessage.put("opcode", "Auth");
+                send(authMessage.toString());
+                System.out.println("WebSocket authentication sent");
+            } catch (Exception e) {
+                System.out.println("Authentication send error: " + e.getMessage());
+            }
+        }
+
+        @Override
+        public void onMessage(String message) {
+            System.out.println("Message received: " + message);
+            
+            try {
+                JSONObject jsonMessage = new JSONObject(message);
+                
+                // Process different message types
+                if (jsonMessage.has("data")) {
+                    JSONObject data = jsonMessage.getJSONObject("data");
+                    if (data.has("lastPrice")) {
+                        System.out.println("Quote: " + data.getString("symbol") + 
+                                          " = " + data.getDouble("lastPrice"));
+                    }
+                } else if (jsonMessage.has("message")) {
+                    System.out.println("Server message: " + jsonMessage.getString("message"));
+                }
+            } catch (Exception e) {
+                System.out.println("Message parsing error: " + e.getMessage());
+            }
+        }
+
+        @Override
+        public void onClose(int code, String reason, boolean remote) {
+            System.out.println("WebSocket connection closed: " + code + " - " + reason);
+            isConnected = false;
+        }
+
+        @Override
+        public void onError(Exception ex) {
+            System.out.println("WebSocket error: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
+    public void disconnect() {
+        if (webSocketClient != null) {
+            webSocketClient.close();
+        }
+        isConnected = false;
+        System.out.println("Connections closed");
+    }
+
+    /**
+     * Interactive tester
+     */
+    public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+        
+        System.out.println("=== Connection tester for Alor OpenAPI production environment ===");
+        
+        System.out.print("Enter Client ID: ");
+        String clientId = scanner.nextLine();
+        
+        System.out.print("Enter Client Secret: ");
+        String clientSecret = scanner.nextLine();
+        
+        // Use fixed credentials
+        System.out.println("Using fixed login: " + FIXED_LOGIN);
+        System.out.println("Using fixed refresh token: " + FIXED_REFRESH_TOKEN.substring(0, 20) + "...");
+        
+        AlorOpenApiProdTester tester = new AlorOpenApiProdTester(clientId, clientSecret);
+        
+        try {
+            // Get tokens
+            boolean tokenSuccess = tester.obtainTokens();
+            if (!tokenSuccess) {
+                System.out.println("❌ Failed to get tokens. Exiting.");
+                return;
+            }
+            
+            // Test REST
+            boolean restSuccess = tester.testRestConnection();
+            
+            // Get instrument information
+            boolean securitiesSuccess = tester.testSecuritiesInfo("SBER", "MOEX");
+            
+            // Test WebSocket
+            boolean wsSuccess = tester.testWebSocketConnection();
+            
+            if (restSuccess && securitiesSuccess && wsSuccess) {
+                System.out.println("\n🎉 All connections working successfully!");
+                System.out.println("Alor OpenAPI production environment is available.");
+            } else {
+                System.out.println("\n⚠️ Some connections failed:");
+                if (!restSuccess) System.out.println("- REST connection failed");
+                if (!securitiesSuccess) System.out.println("- Instrument information retrieval failed");
+                if (!wsSuccess) System.out.println("- WebSocket connection failed");
+            }
+            
+            System.out.println("\nWaiting for messages for 30 seconds...");
+            System.out.println("Press Ctrl+C to exit early");
+            Thread.sleep(30000);
+            
+        } catch (Exception e) {
+            System.out.println("Testing error: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            tester.disconnect();
+            scanner.close();
+        }
+    }
+}
