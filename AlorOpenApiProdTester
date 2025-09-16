@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Test module for connecting to Alor OpenAPI production environment
- * Documentation: https://alor.dev/docs/api/quick-start/prod-env/
+ * Documentation: https://alor.dev/docs
  */
 public class AlorOpenApiProdTester {
     private static final String REST_URL = "https://api.alor.ru";
@@ -37,7 +37,7 @@ public class AlorOpenApiProdTester {
     private boolean isConnected = false;
 
     public AlorOpenApiProdTester() {
-        this.refreshToken = FIXED_REFRESH_TOKEN; // Use the provided refresh token
+        this.refreshToken = FIXED_REFRESH_TOKEN;
         
         this.httpClient = new OkHttpClient.Builder()
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -47,20 +47,23 @@ public class AlorOpenApiProdTester {
     }
 
     /**
-     * Get JWT token via OAuth2 using refresh token
+     * Get JWT token via OAuth2 using password grant type
      */
     public boolean obtainTokens() {
         System.out.println("Getting JWT token for production environment...");
         
         try {
-            // Encode client_id and client_secret for Basic Auth
+            // Create form-encoded request body
+            RequestBody body = new FormBody.Builder()
+                    .add("grant_type", "password")
+                    .add("username", FIXED_LOGIN)
+                    .add("password", FIXED_PASSWORD)
+                    .add("scope", "trade")
+                    .build();
+
+            // Create Basic Auth header
             String credentials = CLIENT_ID + ":" + CLIENT_SECRET;
             String basicAuth = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes());
-            
-            RequestBody body = new FormBody.Builder()
-                    .add("grant_type", "refresh_token")
-                    .add("refresh_token", refreshToken)
-                    .build();
 
             Request request = new Request.Builder()
                     .url(TOKEN_URL)
@@ -75,7 +78,7 @@ public class AlorOpenApiProdTester {
                     JSONObject jsonResponse = new JSONObject(responseBody);
                     
                     accessToken = jsonResponse.getString("access_token");
-                    refreshToken = jsonResponse.getString("refresh_token"); // Update refresh token
+                    refreshToken = jsonResponse.getString("refresh_token");
                     
                     System.out.println("✅ Tokens successfully received!");
                     System.out.println("Access Token: " + accessToken.substring(0, 20) + "...");
@@ -85,13 +88,93 @@ public class AlorOpenApiProdTester {
                 } else {
                     System.out.println("❌ Token retrieval error: " + response.code() + " - " + response.message());
                     if (response.body() != null) {
-                        System.out.println("Details: " + response.body().string());
+                        String errorBody = response.body().string();
+                        System.out.println("Details: " + errorBody);
+                        
+                        // Try to parse as JSON for more detailed error information
+                        try {
+                            JSONObject errorJson = new JSONObject(errorBody);
+                            if (errorJson.has("error")) {
+                                System.out.println("Error: " + errorJson.getString("error"));
+                            }
+                            if (errorJson.has("error_description")) {
+                                System.out.println("Error description: " + errorJson.getString("error_description"));
+                            }
+                        } catch (Exception e) {
+                            // If not JSON, just print the raw response
+                            System.out.println("Raw response: " + errorBody);
+                        }
                     }
                     return false;
                 }
             }
         } catch (Exception e) {
             System.out.println("❌ Exception during token retrieval: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    /**
+     * Refresh JWT token using refresh token
+     */
+    public boolean refreshTokens() {
+        System.out.println("Refreshing JWT token...");
+        
+        try {
+            // Create form-encoded request body
+            RequestBody body = new FormBody.Builder()
+                    .add("grant_type", "refresh_token")
+                    .add("refresh_token", refreshToken)
+                    .add("scope", "trade")
+                    .build();
+
+            // Create Basic Auth header
+            String credentials = CLIENT_ID + ":" + CLIENT_SECRET;
+            String basicAuth = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes());
+
+            Request request = new Request.Builder()
+                    .url(TOKEN_URL)
+                    .post(body)
+                    .addHeader("Authorization", basicAuth)
+                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
+                    .build();
+
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (response.isSuccessful()) {
+                    String responseBody = response.body().string();
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+                    
+                    accessToken = jsonResponse.getString("access_token");
+                    refreshToken = jsonResponse.getString("refresh_token");
+                    
+                    System.out.println("✅ Tokens successfully refreshed!");
+                    return true;
+                } else {
+                    System.out.println("❌ Token refresh error: " + response.code() + " - " + response.message());
+                    if (response.body() != null) {
+                        String errorBody = response.body().string();
+                        System.out.println("Details: " + errorBody);
+                        
+                        // Try to parse as JSON for more detailed error information
+                        try {
+                            JSONObject errorJson = new JSONObject(errorBody);
+                            if (errorJson.has("error")) {
+                                System.out.println("Error: " + errorJson.getString("error"));
+                            }
+                            if (errorJson.has("error_description")) {
+                                System.out.println("Error description: " + errorJson.getString("error_description"));
+                            }
+                        } catch (Exception e) {
+                            // If not JSON, just print the raw response
+                            System.out.println("Raw response: " + errorBody);
+                        }
+                    }
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("❌ Exception during token refresh: " + e.getMessage());
             e.printStackTrace();
             return false;
         }
@@ -247,7 +330,7 @@ public class AlorOpenApiProdTester {
             System.out.println("WebSocket connection opened");
             isConnected = true;
             
-            // Send welcome message with JWT
+            // Send JWT token for authentication
             try {
                 JSONObject authMessage = new JSONObject();
                 authMessage.put("token", accessToken);
@@ -317,11 +400,17 @@ public class AlorOpenApiProdTester {
         AlorOpenApiProdTester tester = new AlorOpenApiProdTester();
         
         try {
-            // Get tokens
+            // Get tokens using password grant type
             boolean tokenSuccess = tester.obtainTokens();
             if (!tokenSuccess) {
-                System.out.println("❌ Failed to get tokens. Exiting.");
-                return;
+                System.out.println("❌ Failed to get tokens. Trying refresh token...");
+                
+                // Try using refresh token
+                tokenSuccess = tester.refreshTokens();
+                if (!tokenSuccess) {
+                    System.out.println("❌ Failed to get tokens with refresh token. Exiting.");
+                    return;
+                }
             }
             
             // Test REST
