@@ -1,0 +1,125 @@
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class AlorApiClient {
+
+    // === Ваши данные ===
+    private static final String REFRESH_TOKEN = "d048ce72-0c81-4568-93e6-dcf60444f860";
+    private static final String CLIENT_ID = "a602562664d34e208495";
+    private static final String CLIENT_SECRET = "0Fk1ht108ycmXufR1IIB1M6+W7r8SirF3ImAYaZJdWM=";
+
+    // === Продакшн эндпоинты ===
+    private static final String REFRESH_URL = "https://oauth.alor.ru/refresh";
+    private static final String BASE_URL = "https://api.alor.ru";
+
+    private final HttpClient httpClient;
+    private final ObjectMapper objectMapper;
+    private String accessToken;
+    private long tokenExpiry = 0;
+
+    public AlorApiClient() {
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        this.objectMapper = new ObjectMapper();
+    }
+
+    /** Получение access_token из refresh_token */
+    public synchronized String getAccessToken() throws Exception {
+        long now = System.currentTimeMillis();
+        if (accessToken != null && now < tokenExpiry - 5000) {
+            return accessToken;
+        }
+
+        String body = "{\"token\":\"" + REFRESH_TOKEN + "\"}";
+
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(REFRESH_URL))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new RuntimeException("Не удалось получить access token, статус " + resp.statusCode() + ", тело: " + resp.body());
+        }
+
+        JsonNode root = objectMapper.readTree(resp.body());
+        String token = root.has("AccessToken")
+                ? root.get("AccessToken").asText()
+                : root.get("access_token").asText();
+
+        accessToken = token;
+        if (root.has("ExpiresIn")) {
+            tokenExpiry = now + root.get("ExpiresIn").asLong() * 1000;
+        } else {
+            tokenExpiry = now + 60 * 60 * 1000;
+        }
+        return accessToken;
+    }
+
+    /** Универсальный GET-запрос */
+    public String get(String path) throws Exception {
+        String token = getAccessToken();
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(BASE_URL + path))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+
+        if (resp.statusCode() == 401) {
+            accessToken = null;
+            token = getAccessToken();
+            req = HttpRequest.newBuilder()
+                    .uri(URI.create(BASE_URL + path))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/json")
+                    .build();
+            resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        }
+
+        if (resp.statusCode() != 200) {
+            throw new RuntimeException("Ошибка запроса: " + resp.statusCode() + ", тело: " + resp.body());
+        }
+
+        return resp.body();
+    }
+
+    public String getOrderBook(String exchange, String symbol) throws Exception {
+        return get("/md/v2/orderbooks/" + exchange + "/" + symbol);
+    }
+
+    public String getLastPrices(String exchange, String symbol) throws Exception {
+        return get("/md/v2/securities/" + exchange + "/" + symbol + "/lastprice");
+    }
+
+    public static void main(String[] args) {
+        try {
+            AlorApiClient api = new AlorApiClient();
+
+            System.out.println("=== Получение стакана по SBER ===");
+            String orderBook = api.getOrderBook("MOEX", "SBER");
+            System.out.println(orderBook);
+
+            System.out.println("\n=== Последняя цена SBER ===");
+            String lastPrice = api.getLastPrices("MOEX", "SBER");
+            System.out.println(lastPrice);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
