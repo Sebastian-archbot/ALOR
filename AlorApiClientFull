@@ -15,16 +15,12 @@ public class AlorApiClientFull {
     private static final String AUTH_URL = "https://oauth.alor.ru/refresh";
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    private String accessToken;
-    private Instant tokenExpiry; // время истечения токена
+    private String accessToken = null;
+    private Instant tokenExpiry = Instant.EPOCH; // задать в прошлом
     private final String refreshToken;
-    private final String clientId;
-    private final String clientSecret;
 
-    public AlorApiClientFull(String refreshToken, String clientId, String clientSecret) {
+    public AlorApiClientFull(String refreshToken) {
         this.refreshToken = refreshToken;
-        this.clientId = clientId;
-        this.clientSecret = clientSecret;
     }
 
     /**
@@ -32,38 +28,44 @@ public class AlorApiClientFull {
      */
     private void refreshAccessToken() throws IOException {
         System.out.println("[INFO] Refreshing access token...");
-        URL url = new URL(AUTH_URL);
+        URL url = new URL("https://oauth.alor.ru/refresh");
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        conn.setRequestProperty("Content-Type", "application/json");
         conn.setDoOutput(true);
 
-        String body = String.format("refresh_token=%s&client_id=%s&client_secret=%s&grant_type=refresh_token",
-                refreshToken, clientId, clientSecret);
+        String body = String.format("{\"token\":\"%s\"}", refreshToken);
 
         try (OutputStream os = conn.getOutputStream()) {
             os.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
         int status = conn.getResponseCode();
-        String response = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        if (status != 200) {
-            throw new RuntimeException("Failed to refresh token, status " + status + ", body: " + response);
+        String responseBody;
+        if (status >= 200 && status < 300) {
+            responseBody = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        } else {
+            responseBody = new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0], StandardCharsets.UTF_8);
+            throw new RuntimeException("[ERROR] Failed to refresh token: status " + status + ", body: " + responseBody);
         }
 
-        JsonNode json = mapper.readTree(response);
-        if (!json.has("access_token")) {
-            throw new RuntimeException("No access_token in response: " + response);
+        JsonNode json = mapper.readTree(responseBody);
+        // ALOR возвращает «AccessToken» или «access_token»
+        if (!json.has("AccessToken") && !json.has("access_token")) {
+            throw new RuntimeException("No access token in refresh response: " + responseBody);
         }
-        this.accessToken = json.get("access_token").asText();
-        this.tokenExpiry = Instant.now().plusSeconds(29 * 60); // 29 минут для запаса
+        String newToken = json.has("AccessToken") ? json.get("AccessToken").asText() : json.get("access_token").asText();
+        this.accessToken = newToken;
+        this.tokenExpiry = Instant.now().plusSeconds(30 * 60 - 60); // 30 минут минус 1 минута запаса
         System.out.println("[INFO] New access token acquired, valid until: " + tokenExpiry);
     }
+
 
     /**
      * Обертка для GET-запросов с проверкой токена и автообновлением
      */
     private String get(String path) throws IOException {
+        // Проверка срока токена
         if (accessToken == null || Instant.now().isAfter(tokenExpiry)) {
             refreshAccessToken();
         }
@@ -75,14 +77,12 @@ public class AlorApiClientFull {
 
         int status = conn.getResponseCode();
         if (status == 401 || status == 403) {
-            System.out.println("[WARN] Access token expired or invalid, refreshing...");
+            System.out.println("[WARN] Access token seems expired or invalid (status " + status + "), refreshing...");
             refreshAccessToken();
-            return get(path); // повторяем запрос с новым токеном
-        }
-
-        if (status != 200) {
-            throw new RuntimeException("Request failed: " + status + ", body: " +
-                    new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0]));
+            return get(path);
+        }if (status != 200) {
+            String err = new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0], StandardCharsets.UTF_8);
+            throw new RuntimeException("[ERROR] GET request failed: status " + status + ", body: " + err);
         }
         return new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
     }
@@ -97,37 +97,36 @@ public class AlorApiClientFull {
         return get(path);
     }
 
-    public Double getLastPriceValue(String exchange, String symbol) throws Exception {
+    public Double getLastPriceValue(String exchange, String symbol) throws IOException {
         try {
-            String quotesJson = getLastPrices(exchange, symbol);
-            JsonNode quotes = mapper.readTree(quotesJson);
-            if (quotes.has("last_price")) {
-                return quotes.get("last_price").asDouble();
+            String quotes = get(String.format("/md/v2/Securities/%s/%s/quotes", exchange, symbol));
+            JsonNode node = mapper.readTree(quotes);
+            if (node.has("last_price")) {
+                return node.get("last_price").asDouble();
             }
-            throw new RuntimeException("No last_price field in quotes");
         } catch (RuntimeException e) {
-            if (e.getMessage().contains("404") || e.getMessage().contains("No last_price")) {
-                System.out.println("[INFO] Quotes unavailable, trying last trade...");
-                String tradesPath = String.format("/md/v2/trades/%s/%s?limit=1&descending=true", exchange, symbol);
-                String tradesJson = get(tradesPath);
-                JsonNode trades = mapper.readTree(tradesJson);
-                if (trades.isArray() && trades.size() > 0) {
-                    return trades.get(0).get("price").asDouble();
-                }
-                System.out.println("[INFO] No trades found, using order book mid-price...");
-                JsonNode orderBook = mapper.readTree(getOrderBook(exchange, symbol));
-                if (orderBook.has("bids") && orderBook.has("asks")
-                        && orderBook.get("bids").size() > 0 && orderBook.get("asks").size() > 0) {
-                    double bid = orderBook.get("bids").get(0).get("price").asDouble();
-                    double ask = orderBook.get("asks").get(0).get("price").asDouble();
-                    return (bid + ask) / 2.0;
-                }
-                throw new RuntimeException("Cannot get last price from any source");
+            if (!e.getMessage().contains("404")) throw e;
+            System.out.println("[INFO] Quotes unavailable, trying last trade...");
+        }
+
+        try {
+            String trades = get(String.format("/md/v2/Securities/%s/%s/alltrades?limit=1", exchange, symbol));
+            JsonNode arr = mapper.readTree(trades);
+            if (arr.isArray() && arr.size() > 0 && arr.get(0).has("price")) {
+                return arr.get(0).get("price").asDouble();
             } else {
-                throw e;
+                System.out.println("[WARN] No trades data returned for " + symbol);
+                return null;
             }
+        } catch (RuntimeException e) {
+            if (e.getMessage().contains("404")) {
+                System.out.println("[WARN] alltrades endpoint returned 404 for " + symbol + ", no price available.");
+                return null;
+            }
+            throw e;
         }
     }
+
 
     public String getHistory(String exchange, String symbol, String interval, Instant from, Instant to) throws Exception {
         String path = String.format("/md/v2/history?symbol=%s&exchange=%s&interval=%s&from=%d&to=%d",
@@ -137,10 +136,10 @@ public class AlorApiClientFull {
 
     public static void main(String[] args) throws Exception {
         String refreshToken = "d048ce72-0c81-4568-93e6-dcf60444f860";
-        String clientId = "a602562664d34e208495";
-        String clientSecret = "0Fk1ht108ycmXufR1IIB1M6+W7r8SirF3ImAYaZJdWM=";
+        String clientId = "5665374bd03343c58186";
+        String clientSecret = "DBg/jDZNvSg4womNNaYdctOmnLUaqDqx8HEWxAznWXc=";
 
-        AlorApiClientFull api = new AlorApiClientFull(refreshToken, clientId, clientSecret);
+        AlorApiClientFull api = new AlorApiClientFull(refreshToken);
 
         System.out.println("=== Order book for SBER ===");
         System.out.println(api.getOrderBook("MOEX", "SBER"));
