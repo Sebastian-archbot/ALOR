@@ -1,0 +1,90 @@
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class AlorApiTest {
+
+    private static final String REFRESH_TOKEN = "d048ce72-0c81-4568-93e6-dcf60444f860";
+    private static final String CLIENT_ID = "a602562664d34e208495";
+    private static final String CLIENT_SECRET = "0Fk1ht108ycmXufR1IIB1M6+W7r8SirF3ImAYaZJdWM=";
+    private static final String ALOR_LOGIN = "+79811455733";
+    private static final String ALOR_PASSWORD = "!Remarque1938!";
+
+    // эндпоинты тестовой среды
+    private static final String REFRESH_URL = "https://oauthdev.alor.ru/refresh?token=" + REFRESH_TOKEN;
+    private static final String ORDER_BOOK_URL_TEMPLATE = "https://apidev.alor.ru/md/v2/orderbooks/%s/%s";  // exchange, symbol
+
+    private final HttpClient httpClient;
+    private final ObjectMapper objectMapper;
+
+    public AlorApiTest() {
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        this.objectMapper = new ObjectMapper();
+    }
+
+    public String getAccessToken() throws Exception {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(REFRESH_URL))
+                .timeout(Duration.ofSeconds(10))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .header("Content-Type", "application/json")
+                .build();
+
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new RuntimeException("Не удалось получить access token, статус " + resp.statusCode() + ", тело: " + resp.body());
+        }
+
+        JsonNode root = objectMapper.readTree(resp.body());
+        // документ говорит, что возвращается JSON объект с ключом "AccessToken"
+        // или иногда "access_token" — проверьте точное имя в вашем случае
+        String accessToken = null;
+        if (root.has("AccessToken")) {
+            accessToken = root.get("AccessToken").asText();
+        } else if (root.has("access_token")) {
+            accessToken = root.get("access_token").asText();
+        } else {
+            throw new RuntimeException("В ответе нет поля AccessToken: " + resp.body());
+        }
+        return accessToken;
+    }
+
+    public String getOrderBook(String exchange, String symbol, String accessToken) throws Exception {
+        String url = String.format(ORDER_BOOK_URL_TEMPLATE, exchange, symbol);
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new RuntimeException("Ошибка запроса OrderBook: статус " + resp.statusCode() + ", тело: " + resp.body());
+        }
+        return resp.body();
+    }
+
+    public static void main(String[] args) {
+        try {
+            AlorApiTest api = new AlorApiTest();
+            String token = api.getAccessToken();
+            System.out.println("Access Token: " + token);
+
+            String orderBookJson = api.getOrderBook("MOEX", "SBER", token);
+            System.out.println("Order Book: " + orderBookJson);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
