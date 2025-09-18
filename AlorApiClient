@@ -1,3 +1,4 @@
+package com.alor.test;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -11,8 +12,8 @@ public class AlorApiClient {
 
     // === Ваши данные ===
     private static final String REFRESH_TOKEN = "d048ce72-0c81-4568-93e6-dcf60444f860";
-    private static final String CLIENT_ID = "a602562664d34e208495";
-    private static final String CLIENT_SECRET = "0Fk1ht108ycmXufR1IIB1M6+W7r8SirF3ImAYaZJdWM=";
+    private static final String CLIENT_ID = "ad26361901b049e69489";
+    private static final String CLIENT_SECRET = "Q6XvCMYY9K2UtabE1IYPJInp8JrX+cRUvSeCk6ZrWSE=";
 
     // === Продакшн эндпоинты ===
     private static final String REFRESH_URL = "https://oauth.alor.ru/refresh";
@@ -48,7 +49,7 @@ public class AlorApiClient {
 
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            throw new RuntimeException("Не удалось получить access token, статус " + resp.statusCode() + ", тело: " + resp.body());
+            throw new RuntimeException("Failed to get access token, status " + resp.statusCode() + ", body: " + resp.body());
         }
 
         JsonNode root = objectMapper.readTree(resp.body());
@@ -92,7 +93,7 @@ public class AlorApiClient {
         }
 
         if (resp.statusCode() != 200) {
-            throw new RuntimeException("Ошибка запроса: " + resp.statusCode() + ", тело: " + resp.body());
+            throw new RuntimeException("Request error: " + resp.statusCode() + ", body: " + resp.body());
         }
 
         return resp.body();
@@ -103,18 +104,29 @@ public class AlorApiClient {
     }
 
     public String getLastPrices(String exchange, String symbol) throws Exception {
-        return get("/md/v2/securities/" + exchange + "/" + symbol + "/lastprice");
+        return get("/md/v2/securities/" + exchange + "/" + symbol + "/quotes");
     }
 
+    public double getLastPriceValue(String exchange, String symbol) throws Exception {
+        String json = getLastPrices(exchange, symbol);
+        JsonNode root = objectMapper.readTree(json);
+        if (root.has("last_price")) {
+            return root.get("last_price").asDouble();
+        }
+        throw new RuntimeException("There is no last_price field in the response:" + json);
+    }
+
+
     public static void main(String[] args) {
+
         try {
             AlorApiClient api = new AlorApiClient();
 
-            System.out.println("=== Получение стакана по SBER ===");
+            System.out.println("=== Receiving a glass via SBER ===");
             String orderBook = api.getOrderBook("MOEX", "SBER");
             System.out.println(orderBook);
 
-            System.out.println("\n=== Последняя цена SBER ===");
+            System.out.println("\n=== Last price SBER ===");
             String lastPrice = api.getLastPrices("MOEX", "SBER");
             System.out.println(lastPrice);
 
