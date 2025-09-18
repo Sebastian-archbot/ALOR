@@ -1,0 +1,157 @@
+package com.alor.test;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+
+public class AlorApiClientFull {
+    private static final String BASE_URL = "https://api.alor.ru";
+    private static final String AUTH_URL = "https://oauth.alor.ru/refresh";
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    private String accessToken;
+    private Instant tokenExpiry; // время истечения токена
+    private final String refreshToken;
+    private final String clientId;
+    private final String clientSecret;
+
+    public AlorApiClientFull(String refreshToken, String clientId, String clientSecret) {
+        this.refreshToken = refreshToken;
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+    }
+
+    /**
+     * Получение access token через refresh token
+     */
+    private void refreshAccessToken() throws IOException {
+        System.out.println("[INFO] Refreshing access token...");
+        URL url = new URL(AUTH_URL);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        conn.setDoOutput(true);
+
+        String body = String.format("refresh_token=%s&client_id=%s&client_secret=%s&grant_type=refresh_token",
+                refreshToken, clientId, clientSecret);
+
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        int status = conn.getResponseCode();
+        String response = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        if (status != 200) {
+            throw new RuntimeException("Failed to refresh token, status " + status + ", body: " + response);
+        }
+
+        JsonNode json = mapper.readTree(response);
+        if (!json.has("access_token")) {
+            throw new RuntimeException("No access_token in response: " + response);
+        }
+        this.accessToken = json.get("access_token").asText();
+        this.tokenExpiry = Instant.now().plusSeconds(29 * 60); // 29 минут для запаса
+        System.out.println("[INFO] New access token acquired, valid until: " + tokenExpiry);
+    }
+
+    /**
+     * Обертка для GET-запросов с проверкой токена и автообновлением
+     */
+    private String get(String path) throws IOException {
+        if (accessToken == null || Instant.now().isAfter(tokenExpiry)) {
+            refreshAccessToken();
+        }
+
+        URL url = new URL(BASE_URL + path);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Authorization", "Bearer " + accessToken);
+
+        int status = conn.getResponseCode();
+        if (status == 401 || status == 403) {
+            System.out.println("[WARN] Access token expired or invalid, refreshing...");
+            refreshAccessToken();
+            return get(path); // повторяем запрос с новым токеном
+        }
+
+        if (status != 200) {
+            throw new RuntimeException("Request failed: " + status + ", body: " +
+                    new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0]));
+        }
+        return new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    }
+
+    public String getOrderBook(String exchange, String symbol) throws Exception {
+        String path = String.format("/md/v2/orderbooks/%s/%s", exchange, symbol);
+        return get(path);
+    }
+
+    public String getLastPrices(String exchange, String symbol) throws Exception {
+        String path = String.format("/md/v2/securities/%s/%s/quotes", exchange, symbol);
+        return get(path);
+    }
+
+    public Double getLastPriceValue(String exchange, String symbol) throws Exception {
+        try {
+            String quotesJson = getLastPrices(exchange, symbol);
+            JsonNode quotes = mapper.readTree(quotesJson);
+            if (quotes.has("last_price")) {
+                return quotes.get("last_price").asDouble();
+            }
+            throw new RuntimeException("No last_price field in quotes");
+        } catch (RuntimeException e) {
+            if (e.getMessage().contains("404") || e.getMessage().contains("No last_price")) {
+                System.out.println("[INFO] Quotes unavailable, trying last trade...");
+                String tradesPath = String.format("/md/v2/trades/%s/%s?limit=1&descending=true", exchange, symbol);
+                String tradesJson = get(tradesPath);
+                JsonNode trades = mapper.readTree(tradesJson);
+                if (trades.isArray() && trades.size() > 0) {
+                    return trades.get(0).get("price").asDouble();
+                }
+                System.out.println("[INFO] No trades found, using order book mid-price...");
+                JsonNode orderBook = mapper.readTree(getOrderBook(exchange, symbol));
+                if (orderBook.has("bids") && orderBook.has("asks")
+                        && orderBook.get("bids").size() > 0 && orderBook.get("asks").size() > 0) {
+                    double bid = orderBook.get("bids").get(0).get("price").asDouble();
+                    double ask = orderBook.get("asks").get(0).get("price").asDouble();
+                    return (bid + ask) / 2.0;
+                }
+                throw new RuntimeException("Cannot get last price from any source");
+            } else {
+                throw e;
+            }
+        }
+    }
+
+    public String getHistory(String exchange, String symbol, String interval, Instant from, Instant to) throws Exception {
+        String path = String.format("/md/v2/history?symbol=%s&exchange=%s&interval=%s&from=%d&to=%d",
+                symbol, exchange, interval, from.toEpochMilli(), to.toEpochMilli());
+        return get(path);
+    }
+
+    public static void main(String[] args) throws Exception {
+        String refreshToken = "d048ce72-0c81-4568-93e6-dcf60444f860";
+        String clientId = "a602562664d34e208495";
+        String clientSecret = "0Fk1ht108ycmXufR1IIB1M6+W7r8SirF3ImAYaZJdWM=";
+
+        AlorApiClientFull api = new AlorApiClientFull(refreshToken, clientId, clientSecret);
+
+        System.out.println("=== Order book for SBER ===");
+        System.out.println(api.getOrderBook("MOEX", "SBER"));
+
+        System.out.println("=== Last price for SBER ===");
+        Double lastPrice = api.getLastPriceValue("MOEX", "SBER");
+        System.out.println("Last price: " + lastPrice);
+
+        System.out.println("=== History M5 for last 24h ===");
+        Instant now = Instant.now();
+        Instant yesterday = now.minusSeconds(24 * 3600);
+        System.out.println(api.getHistory("MOEX", "SBER", "M5", yesterday, now));
+    }
+}
