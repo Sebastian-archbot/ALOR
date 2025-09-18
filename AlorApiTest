@@ -1,4 +1,3 @@
-
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -40,7 +39,7 @@ public class AlorApiTest {
 
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            throw new RuntimeException("Не удалось получить access token, статус " + resp.statusCode() + ", тело: " + resp.body());
+            throw new RuntimeException("Failed to obtain access token, status " + resp.statusCode() + ", body: " + resp.body());
         }
 
         JsonNode root = objectMapper.readTree(resp.body());
@@ -52,7 +51,7 @@ public class AlorApiTest {
         } else if (root.has("access_token")) {
             accessToken = root.get("access_token").asText();
         } else {
-            throw new RuntimeException("В ответе нет поля AccessToken: " + resp.body());
+            throw new RuntimeException("There is no AccessToken field in the response.: " + resp.body());
         }
         return accessToken;
     }
@@ -69,7 +68,7 @@ public class AlorApiTest {
 
         HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            throw new RuntimeException("Ошибка запроса OrderBook: статус " + resp.statusCode() + ", тело: " + resp.body());
+            throw new RuntimeException("OrderBook request error: status " + resp.statusCode() + ", тело: " + resp.body());
         }
         return resp.body();
     }
