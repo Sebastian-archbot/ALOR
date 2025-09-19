@@ -9,6 +9,411 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+package com.alor.test;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+
+/**
+ * Alor API client — fixed history handling:
+ * - uses /md/v2/Securities/{exchange}/{symbol}/candles
+ * - uses query param "tf" (seconds or codes)
+ * - from/to in epoch SECONDS
+ * - supports client-side aggregation (e.g. M10) by fetching a base TF (M1/M5) and aggregating
+ * - CSV output DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOL (Europe/Warsaw)
+ *
+ * Console messages are in English.
+ */
+public class AlorApiClientFull {
+    private static final String BASE_URL = "https://api.alor.ru";
+    private static final String AUTH_URL = "https://oauth.alor.ru/refresh";
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    private String accessToken = null;
+    private Instant tokenExpiry = Instant.EPOCH; // set to past
+    private final String refreshToken;
+
+    public AlorApiClientFull(String refreshToken) {
+        this.refreshToken = refreshToken;
+    }
+
+    /**
+     * Получение access token через refresh token
+     */
+    private void refreshAccessToken() throws IOException {
+        System.out.println("[INFO] Refreshing access token...");
+        URL url = new URL(AUTH_URL);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setDoOutput(true);
+
+        String body = String.format("{\"token\":\"%s\"}", refreshToken);
+
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        int status = conn.getResponseCode();
+        String responseBody;
+        if (status >= 200 && status < 300) {
+            responseBody = new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        } else {
+            responseBody = new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0], StandardCharsets.UTF_8);
+            throw new RuntimeException("[ERROR] Failed to refresh token: status " + status + ", body: " + responseBody);
+        }
+
+        JsonNode json = mapper.readTree(responseBody);
+        // ALOR may return AccessToken or access_token
+        if (!json.has("AccessToken") && !json.has("access_token")) {
+            throw new RuntimeException("No access token in refresh response: " + responseBody);
+        }
+        String newToken = json.has("AccessToken") ? json.get("AccessToken").asText() : json.get("access_token").asText();
+        this.accessToken = newToken;
+        this.tokenExpiry = Instant.now().plusSeconds(30 * 60 - 60); // 30 minutes minus 1 min safety
+        System.out.println("[INFO] New access token acquired, valid until: " + tokenExpiry);
+    }
+
+    /**
+     * Обертка для GET-запросов с проверкой токена и автообновлением
+     */
+    private String get(String path) throws IOException {
+        // Проверка срока токена
+        if (accessToken == null || Instant.now().isAfter(tokenExpiry)) {
+            refreshAccessToken();
+        }
+
+        URL url = new URL(BASE_URL + path);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Authorization", "Bearer " + accessToken);
+
+        int status = conn.getResponseCode();
+        if (status == 401 || status == 403) {
+            System.out.println("[WARN] Access token seems expired or invalid (status " + status + "), refreshing...");
+            refreshAccessToken();
+            return get(path);
+        }
+        if (status != 200) {
+            String err = new String(conn.getErrorStream() != null ? conn.getErrorStream().readAllBytes() : new byte[0], StandardCharsets.UTF_8);
+            throw new RuntimeException("[ERROR] GET request failed: status " + status + ", body: " + err);
+        }
+        return new String(conn.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    }
+
+    public String getOrderBook(String exchange, String symbol) throws Exception {
+        String path = String.format("/md/v2/orderbooks/%s/%s", exchange, symbol);
+        return get(path);
+    }
+
+    public String getLastPrices(String exchange, String symbol) throws Exception {
+        String path = String.format("/md/v2/securities/%s/%s/quotes", exchange, symbol);
+        return get(path);
+    }
+
+    public Double getLastPriceValue(String exchange, String symbol) throws IOException {
+        try {
+            String quotes = get(String.format("/md/v2/Securities/%s/%s/quotes", exchange, symbol));
+            JsonNode node = mapper.readTree(quotes);
+            if (node.has("last_price")) {
+                return node.get("last_price").asDouble();
+            }
+        } catch (RuntimeException e) {
+            if (!e.getMessage().contains("404")) throw e;
+            System.out.println("[INFO] Quotes unavailable, trying last trade...");
+        }
+
+        try {
+            String trades = get(String.format("/md/v2/Securities/%s/%s/alltrades?limit=1", exchange, symbol));
+            JsonNode arr = mapper.readTree(trades);
+            if (arr.isArray() && arr.size() > 0 && arr.get(0).has("price")) {
+                return arr.get(0).get("price").asDouble();
+            } else {
+                System.out.println("[WARN] No trades data returned for " + symbol);
+                return null;
+            }
+        } catch (RuntimeException e) {
+            if (e.getMessage().contains("404")) {
+                System.out.println("[WARN] alltrades endpoint returned 404 for " + symbol + ", no price available.");
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Parse interval string to API 'tf' parameter.
+     * Accepts:
+     *   - numeric seconds as string ("60","300")
+     *   - "M1","M5","M10","H1" etc -> converted to seconds ("60","300","600","3600")
+     *   - single-letter codes: "D","W","M","Y" -> passed as-is
+     */
+    private String intervalToTf(String interval) {
+        if (interval == null) throw new IllegalArgumentException("interval is null");
+        interval = interval.trim().toUpperCase();
+        // pure numeric => return
+        if (interval.matches("^\\d+$")) return interval;
+        // single-letter codes D/W/M/Y
+        if (interval.equals("D") || interval.equals("W") || interval.equals("M") || interval.equals("Y")) return interval;
+        // patterns like M5, M10, H1, S15
+        if (interval.matches("^[MHSD]\\d+$")) {
+            char unit = interval.charAt(0);
+            int val = Integer.parseInt(interval.substring(1));
+            switch (unit) {
+                case 'S': return String.valueOf(val); // seconds
+                case 'M': return String.valueOf(val * 60); // minutes -> seconds
+                case 'H': return String.valueOf(val * 3600); // hours -> seconds
+                case 'D': return String.valueOf(val * 86400); // days -> seconds
+                default: break;
+            }
+        }
+        // fallback: try to interpret like "M" + number
+        if (interval.matches("^M\\d+$")) {
+            int minutes = Integer.parseInt(interval.substring(1));
+            return String.valueOf(minutes * 60);
+        }
+        // unknown -> return as-is (server may reject)
+        return interval;
+    }
+
+    /**
+     * Fetch raw candles from API for securities endpoint.
+     * Uses /md/v2/Securities/{exchange}/{symbol}/candles?tf={tf}&from={fromSec}&to={toSec}&format=Simple
+     */
+    private List<Candle> fetchCandles(String exchange, String symbol, String tfParam, Instant from, Instant to) throws IOException {
+        String path = String.format("/md/v2/Securities/%s/%s/candles?tf=%s&from=%d&to=%d&format=Simple",
+                exchange, symbol, tfParam, from.getEpochSecond(), to.getEpochSecond());
+        System.out.println("[DEBUG] Requesting candles: " + path);
+        String resp = get(path);
+
+        JsonNode root = mapper.readTree(resp);
+        JsonNode arr = null;
+        if (root.isArray()) {
+            arr = root;
+        } else if (root.has("candles") && root.get("candles").isArray()) {
+            arr = root.get("candles");
+        } else if (root.has("items") && root.get("items").isArray()) {
+            arr = root.get("items");
+        } else {
+            // maybe API returns object with fields time/open/high/low/close? try to interpret
+            throw new RuntimeException("[ERROR] Unexpected candles response structure: " + resp);
+        }
+
+        List<Candle> result = new ArrayList<>();
+        for (JsonNode node : arr) {
+            long t = 0;
+            if (node.has("time")) t = node.get("time").asLong();
+            else if (node.has("timestamp")) t = node.get("timestamp").asLong();
+            else if (node.has("dt")) t = node.get("dt").asLong();
+            else if (node.has("date")) t = node.get("date").asLong();
+            else throw new RuntimeException("Candle object has no time field: " + node.toString());
+
+            double open = node.path("open").asDouble(Double.NaN);
+            double high = node.path("high").asDouble(Double.NaN);
+            double low = node.path("low").asDouble(Double.NaN);
+            double close = node.path("close").asDouble(Double.NaN);
+            double volume = node.has("volume") ? node.get("volume").asDouble() : node.path("vol").asDouble(0.0);
+
+            // ensure values exist
+            if (Double.isNaN(open) || Double.isNaN(high) || Double.isNaN(low) || Double.isNaN(close)) {
+                // Try alternative field names
+                open = node.path("o").asDouble(open);
+                high = node.path("h").asDouble(high);
+                low = node.path("l").asDouble(low);
+                close = node.path("c").asDouble(close);
+            }
+
+            result.add(new Candle(t, open, high, low, close, volume));
+        }
+        return result;
+    }
+
+    /**
+     * Public method: returns CSV string aggregated to requested interval.
+     * interval examples: "M5", "M10", "M1", "60" (seconds), "D"
+     */
+    private String getHistoryCsv(String symbol, String exchange, int tf, long from, long to) {
+        String endpoint = String.format(
+                "/md/v2/securities/%s/%s/candles?tf=%d&from=%d&to=%d",
+                exchange.toLowerCase(), symbol.toUpperCase(), tf, from, to
+        );
+
+        System.out.println("[DEBUG] Requesting candles: " + endpoint);
+
+        try {
+            String json = get(endpoint); // без format=Simple, API вернет JSON по умолчанию
+            if (json == null || json.isEmpty()) {
+                throw new RuntimeException("[ERROR] Empty response for historical candles");
+            }
+
+            // Разбор JSON (считаем что возвращается массив свечей)
+            JSONArray candles = new JSONArray(json);
+            StringBuilder csv = new StringBuilder("DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOL\n");
+
+            for (int i = 0; i < candles.length(); i++) {
+                JSONObject c = candles.getJSONObject(i);
+                long timestamp = c.getLong("time");
+                double open = c.getDouble("open");
+                double close = c.getDouble("close");
+                double high = c.getDouble("high");
+                double low = c.getDouble("low");
+                double volume = c.optDouble("volume", 0);
+
+                // Преобразуем timestamp → дата/время
+                Instant instant = Instant.ofEpochSecond(timestamp);
+                LocalDateTime dateTime = LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+
+                csv.append(String.format(
+                        "%s,%s,%.2f,%.2f,%.2f,%.2f,%.0f\n",
+                        dateTime.toLocalDate(), dateTime.toLocalTime(),
+                        open, high, low, close, volume
+                ));
+            }
+
+            return csv.toString();
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to obtain historical candles for " + symbol +
+                    " [tf=" + tf + "] : " + e.getMessage(), e);
+        }
+    }
+
+
+    private long computeSecondsFromCandles(List<Candle> list) {
+        if (list.size() < 2) return 60;
+        long delta = list.get(1).time - list.get(0).time;
+        return Math.max(1, delta);
+    }
+
+    /**
+     * Aggregate base candles (baseCandles must be in ascending time order) into larger timeframe (seconds)
+     */
+    private List<Candle> aggregateCandles(List<Candle> baseCandles, long targetSeconds) {
+        if (baseCandles.isEmpty()) return Collections.emptyList();
+        // group by bucket: floor(time / targetSeconds) * targetSeconds
+        TreeMap<Long, List<Candle>> groups = new TreeMap<>();
+        for (Candle c : baseCandles) {
+            long bucket = (c.time / targetSeconds) * targetSeconds;
+            groups.computeIfAbsent(bucket, k -> new ArrayList<>()).add(c);
+        }
+        List<Candle> result = new ArrayList<>();
+        for (Map.Entry<Long, List<Candle>> e : groups.entrySet()) {
+            List<Candle> group = e.getValue();
+            group.sort(Comparator.comparingLong(x -> x.time));
+            double open = group.get(0).open;
+            double close = group.get(group.size() - 1).close;
+            double high = group.stream().mapToDouble(x -> x.high).max().orElse(open);
+            double low = group.stream().mapToDouble(x -> x.low).min().orElse(open);
+            double vol = group.stream().mapToDouble(x -> x.volume).sum();
+            result.add(new Candle(e.getKey(), open, high, low, close, vol));
+        }
+        return result;
+    }
+
+    /**
+     * Convert list of candles to CSV.
+     * DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOL — DATE and TIME are in Europe/Warsaw timezone
+     */
+    private String toCsv(List<Candle> candles, long tfSeconds) {
+        // ensure sorted ascending by time
+        candles.sort(Comparator.comparingLong(c -> c.time));
+        StringBuilder sb = new StringBuilder();
+        sb.append("DATE,TIME,OPEN,HIGH,LOW,CLOSE,VOL\n");
+        ZoneId zone = ZoneId.of("Europe/Warsaw");
+        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd,HH:mm:ss");
+        for (Candle c : candles) {
+            Instant inst = Instant.ofEpochSecond(c.time);
+            ZonedDateTime z = inst.atZone(zone);
+            sb.append(dtf.format(z))
+                    .append(",")
+                    .append(formatDouble(c.open))
+                    .append(",")
+                    .append(formatDouble(c.high))
+                    .append(",")
+                    .append(formatDouble(c.low))
+                    .append(",")
+                    .append(formatDouble(c.close))
+                    .append(",")
+                    .append(formatDouble(c.volume))
+                    .append("\n");
+        }
+        return sb.toString();
+    }
+
+    private String formatDouble(double v) {
+        if (Math.abs(v - Math.round(v)) < 1e-9) return String.valueOf((long)Math.round(v));
+        return String.valueOf(v);
+    }
+
+    private static class Candle {
+        long time; // epoch seconds
+        double open, high, low, close;
+        double volume;
+
+        Candle(long time, double open, double high, double low, double close, double volume) {
+            this.time = time;
+            this.open = open;
+            this.high = high;
+            this.low = low;
+            this.close = close;
+            this.volume = volume;
+        }
+    }
+
+    private static int parseTf(String tf) {
+        if (tf.startsWith("M")) { // например "M10" → 10 минут
+            return Integer.parseInt(tf.substring(1)) * 60;
+        } else if (tf.startsWith("H")) { // например "H1" → 1 час
+            return Integer.parseInt(tf.substring(1)) * 3600;
+        } else if (tf.startsWith("S")) { // например "S30" → 30 секунд
+            return Integer.parseInt(tf.substring(1));
+        }
+        throw new IllegalArgumentException("Unsupported timeframe: " + tf);
+    }
+
+
+    // ----------------- example usage -----------------
+    public static void main(String[] args) throws Exception {
+        String refreshToken = "d048ce72-0c81-4568-93e6-dcf60444f860"; // your refresh token
+        AlorApiClientFull api = new AlorApiClientFull(refreshToken);
+
+        System.out.println("=== Order book for SBER ===");
+        System.out.println(api.getOrderBook("MOEX", "SBER"));
+
+        System.out.println("=== Last price for SBER ===");
+        Double lastPrice = api.getLastPriceValue("MOEX", "SBER");
+        System.out.println("Last price: " + lastPrice);
+
+        try {
+        long now = Instant.now().toEpochMilli();                 // ✅ миллисекунды
+        long yesterday = now - 24 * 60 * 60 * 1000L;             // вычитаем сутки
+
+        System.out.println("=== History M10 for last 24h (CSV) ===");
+        String csvM10 = api.getHistoryCsv("MOEX", "SBER", parseTf("M10"), yesterday, now);
+        System.out.println(csvM10);
+
+        System.out.println("=== History M5 for last 24h (CSV) ===");
+        String csvM5 = api.getHistoryCsv("MOEX", "SBER", parseTf("M5"), yesterday, now);
+        System.out.println(csvM5);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+    }
+}
 
 public class AlorApiClientFull {
     private static final String BASE_URL = "https://api.alor.ru";
